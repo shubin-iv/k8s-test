@@ -1,0 +1,132 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-app
+  labels:
+    app: web-app
+spec:
+  # Не совсем понял что значит "на первые запросы приложению требуется значительно больше ресурсов"
+  # Предположу, что речь о неких первых запросах после запуска приложения, поэтому создадим на старте больше реплик, позже их уменьшим.
+  replicas: 3
+  strategy:
+    # По апдейтам задач не было, так что возьмём РоллинАпдейт со стандарными настройками
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app: web-app
+  template:
+    metadata:
+      labels:
+        app: web-app
+    spec:
+      affinity:
+        # Для отказоустойчивости распределим наши поды по разным зонам
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - web-app
+            topologyKey: topology.kubernetes.io/zone
+      containers:
+      - name: web-app
+        image: gitlab.company.com:5050/projectname/reponame/our-web-app:latest
+        ports:
+        - containerPort: 80
+        resources:
+          limits:
+            cpu: 150m
+            memory: 140Mi
+          requests:
+            # Я надеюсь, что когда в задании озвучивали обработку пиковой нагрузки 4-мя подами, имелось ввиду, что 4 пода с нагрузкой 0.1 с ней справятся.
+            # Если я неправильно понял - можем немного повысить запрос.
+            # В итоге я немного сомневаюсь, недостаточно опыта, но кажется, что стоит запросы сделать чуть больше, чем реальное потребление ресурсов.
+            cpu: 110m
+            memory: 130Mi
+        startupProbe:
+        # Сейчас не могу проверить такие нюансы, но к примеру во время наших уроков при запуске нескольких подов время их старта увеличивалось кратно их количеству
+        # Поэтому на всякий случай исходя из максимального значения при запуске 4 подов однвременно - 40 секунд
+        # Я выставляю 15 попыток проверки каждые 3 секунды. Мы ничего не теряем, если приложение запустится раньше.
+          httpGet:
+            path: /
+            port: 80
+          periodSeconds: 3
+          failureThreshold: 15
+        livenessProbe:
+        # Ну и не забудем про периодические проверки жизнеспособности пода
+          httpGet:
+            path: /
+            port: 80
+          failureThreshold: 1
+          periodSeconds: 10
+
+---
+apiVersion: autoscaling/v2beta2
+kind: HorizontalPodAutoscaler
+# Для соблюдения балланса считаю достаточным использовать HorizontalPodAutoscaler для автоматического масштабирования в зависимости от нагрузки
+# Можно дополнительно использовать kube-downscaler с настройкой рабочего времени, но этим мы можем добиться только снижения количества до 1 пода или вообще до нуля
+# Но это как-то совсем противоречит нашему желанию максимальной доступности и разумно, на мой взгляд, только для каких-то тестовых ресурсов.
+metadata:
+  name: web-app
+  labels:
+    app: web-app
+spec:
+# Сложно сказать где грань между максимальной отказоустойчивостью и минимальным потреблением ресурсов.
+# Всё таки я полагаю деплоймент с одной репликой не может быть отказоусточивым, возьмём за минимум хотя бы две.
+# К сожалению это противоречит минимальному потреблению ресурсов, ну что поделать.
+  minReplicas: 2
+# Так как нам известно, что 4 пода справляются с пиковой нагрузкой, выставляем соответствующее количество
+  maxReplicas: 4
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web-app
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          # При средней нагрузке превышающей наш запрос ресурсов увеличиваем количество подов.
+          averageUtilization: 110
+
+# Дальше сервис и ингресс написаны только чтобы это выглядело как полноценно работоспособное приложение.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-app
+  labels:
+    app: web-app
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    protocol: TCP
+    targetPort: 80
+  selector:
+    app: web-app
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web-app
+spec:
+  ingressClassName: "nginx"
+  tls:
+  - hosts:
+    - "web-app.company.com"
+  rules:
+  - host: "web-app.company.com"
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: web-app
+            port: 
+              number: 80
